@@ -60,7 +60,10 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     are exposed in updates as ``message_thread_id`` plus a reply anchor. Live
     user-message replies route with ``message_thread_id`` + ``reply_to_message_id``;
     synthetic/resumed sends that have no reply anchor fall back to Telegram's
-    ``direct_messages_topic_id`` when the Bot API supports it.
+    ``direct_messages_topic_id`` when the Bot API supports it. Feishu
+    topics likewise must be routed through message.reply with
+    reply_in_thread=true; metadata carries that reply anchor to non-text send
+    paths that do not receive an explicit ``reply_to``.
     """
     thread_id = getattr(source, "thread_id", None)
     if thread_id is None:
@@ -74,6 +77,10 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         anchor = reply_to_message_id or getattr(source, "message_id", None)
         if anchor is not None:
             metadata["telegram_reply_to_message_id"] = str(anchor)
+    if _platform_name(getattr(source, "platform", None)) == "feishu":
+        anchor = reply_to_message_id or getattr(source, "message_id", None) or thread_id
+        if anchor is not None:
+            metadata["reply_to_message_id"] = str(anchor)
     return metadata
 
 

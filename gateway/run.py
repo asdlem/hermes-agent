@@ -12405,8 +12405,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             tid = str(thread_id)
             if tid and tid not in {"", "1"}:
                 metadata["direct_messages_topic_id"] = tid
-            if reply_to_message_id is not None:
-                metadata["telegram_reply_to_message_id"] = str(reply_to_message_id)
+            anchor = reply_to_message_id or getattr(source, "message_id", None)
+            if anchor is not None:
+                metadata["telegram_reply_to_message_id"] = str(anchor)
+        if getattr(source, "platform", None) == Platform.FEISHU:
+            anchor = reply_to_message_id or getattr(source, "message_id", None) or thread_id
+            if anchor is not None:
+                metadata["reply_to_message_id"] = str(anchor)
         return metadata
 
     @staticmethod
