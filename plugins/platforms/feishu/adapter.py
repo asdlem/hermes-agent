@@ -255,6 +255,7 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
 _FEISHU_MESSAGE_TEXT_CACHE_SIZE = 512       # LRU cap for reply-context message text lookups
+_FEISHU_PARENT_CONTEXT_CACHE_SIZE = 256     # LRU cap for parent-context (text, media_urls, media_types) lookups
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -1481,6 +1482,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        self._parent_context_cache: "OrderedDict[str, tuple[Optional[str], List[str], List[str]]]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -3243,11 +3245,6 @@ class FeishuAdapter(BasePlatformAdapter):
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
-        # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
-        if inbound_type == MessageType.TEXT and not text and not media_urls:
-            logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
-            return
-
         if inbound_type != MessageType.COMMAND:
             hint = _build_mention_hint(mentions)
             if hint:
@@ -3260,7 +3257,21 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "root_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_to_text: Optional[str] = None
+        if reply_to_message_id:
+            parent_text, parent_media_urls, parent_media_types = await self._fetch_message_context(reply_to_message_id)
+            reply_to_text = parent_text
+            # Merge parent attachment media into the inbound event so the
+            # agent can see what the user is replying to.
+            if parent_media_urls:
+                media_urls = list(parent_media_urls) + list(media_urls)
+                media_types = list(parent_media_types) + list(media_types)
+
+        # Guard runs AFTER parent reply context hydration so a bare @Bot
+        # reply to a message with attachments is not dropped.
+        if inbound_type == MessageType.TEXT and not text and not media_urls:
+            logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
+            return
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -4171,11 +4182,33 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+        """Fetch the text content of a parent/reply-to message.
+
+        Delegates to :meth:`_fetch_message_context` and returns only the ``text`` portion.
+        """
+        text, _media_urls, _media_types = await self._fetch_message_context(message_id)
+        return text
+
+    async def _fetch_message_context(
+        self, message_id: str
+    ) -> tuple[Optional[str], List[str], List[str]]:
+        """Fetch the full context of a parent/reply-to message.
+
+        Returns ``(text, media_urls, media_types)`` where ``media_urls`` and
+        ``media_types`` are the cached local paths and MIME types for any
+        images, files, audio, or other attachments on the parent message.
+
+        Results are cached in ``_parent_context_cache`` bounded by
+        ``_FEISHU_PARENT_CONTEXT_CACHE_SIZE``.
+        """
         if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
+            return None, [], []
+
+        # Check parent-context cache first (bounded OrderedDict).
+        if message_id in self._parent_context_cache:
+            self._parent_context_cache.move_to_end(message_id)
+            return self._parent_context_cache[message_id]
+
         try:
             request = self._build_get_message_request(message_id)
             response = await self._run_blocking(self._client.im.v1.message.get, request)
@@ -4183,42 +4216,78 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
                 logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
+                result = (None, [], [])
+                self._parent_context_cache[message_id] = result
+                while len(self._parent_context_cache) > _FEISHU_PARENT_CONTEXT_CACHE_SIZE:
+                    self._parent_context_cache.popitem(last=False)
+                return result
+
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
             body = getattr(parent, "body", None)
             msg_type = getattr(parent, "msg_type", "") or ""
             raw_content = getattr(body, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
+
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
+                bot=self._bot_identity(),
             )
-            self._message_text_cache[message_id] = text
-            while len(self._message_text_cache) > _FEISHU_MESSAGE_TEXT_CACHE_SIZE:
-                self._message_text_cache.popitem(last=False)
-            return text
+            text = self._extract_text_from_normalized(normalized)
+
+            # Download parent media resources.
+            media_urls: List[str] = []
+            media_types: List[str] = []
+
+            for image_key in normalized.image_keys:
+                cached_path, media_type = await self._download_feishu_image(
+                    message_id=message_id,
+                    image_key=image_key,
+                )
+                if cached_path:
+                    media_urls.append(cached_path)
+                    media_types.append(media_type)
+
+            for media_ref in normalized.media_refs:
+                cached_path, media_type = await self._download_feishu_message_resource(
+                    message_id=message_id,
+                    file_key=media_ref.file_key,
+                    resource_type=media_ref.resource_type,
+                    fallback_filename=media_ref.file_name,
+                )
+                if cached_path:
+                    media_urls.append(cached_path)
+                    media_types.append(media_type)
+
+            result = (text, media_urls, media_types)
+            self._parent_context_cache[message_id] = result
+            while len(self._parent_context_cache) > _FEISHU_PARENT_CONTEXT_CACHE_SIZE:
+                self._parent_context_cache.popitem(last=False)
+            return result
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
+            fallback = (None, [], [])
+            self._parent_context_cache[message_id] = fallback
+            while len(self._parent_context_cache) > _FEISHU_PARENT_CONTEXT_CACHE_SIZE:
+                self._parent_context_cache.popitem(last=False)
+            return fallback
 
-    def _extract_text_from_raw_content(
-        self,
-        *,
-        msg_type: str,
-        raw_content: str,
-        mentions: Optional[Sequence[Any]] = None,
-    ) -> Optional[str]:
-        normalized = normalize_feishu_message(
-            message_type=msg_type,
-            raw_content=raw_content,
-            mentions=mentions,
-            bot=self._bot_identity(),
-        )
+    @staticmethod
+    def _extract_text_from_normalized(normalized: FeishuNormalizedMessage) -> Optional[str]:
+        """Extract displayable text from a :class:`FeishuNormalizedMessage`.
+
+        Returns ``text_content`` when present, otherwise falls back to any
+        ``placeholder_text`` stored in metadata.
+        """
         if normalized.text_content:
             return normalized.text_content
-        placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
+        placeholder = (
+            normalized.metadata.get("placeholder_text")
+            if isinstance(normalized.metadata, dict)
+            else None
+        )
         return str(placeholder).strip() or None
 
     @staticmethod

@@ -1560,20 +1560,25 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, ["video/mp4"])
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_extract_text_from_raw_content_uses_relation_message_fallbacks(self):
+    def test_extract_text_from_normalized_uses_relation_message_fallbacks(self):
         from gateway.config import PlatformConfig
-        from plugins.platforms.feishu.adapter import FeishuAdapter
+        from plugins.platforms.feishu.adapter import FeishuAdapter, normalize_feishu_message
 
         adapter = FeishuAdapter(PlatformConfig())
 
-        shared = adapter._extract_text_from_raw_content(
-            msg_type="share_chat",
+        shared_norm = normalize_feishu_message(
+            message_type="share_chat",
             raw_content='{"chat_id":"oc_shared","chat_name":"Platform Ops"}',
+            bot=adapter._bot_identity(),
         )
-        attachment = adapter._extract_text_from_raw_content(
-            msg_type="file",
+        shared = FeishuAdapter._extract_text_from_normalized(shared_norm)
+
+        attach_norm = normalize_feishu_message(
+            message_type="file",
             raw_content='{"file_key":"file_1","file_name":"report.pdf"}',
+            bot=adapter._bot_identity(),
         )
+        attachment = FeishuAdapter._extract_text_from_normalized(attach_norm)
 
         self.assertEqual(shared, "Shared chat: Platform Ops\nChat ID: oc_shared")
         self.assertEqual(attachment, "[Attachment: report.pdf]")
@@ -2078,7 +2083,7 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
         )
-        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        adapter._fetch_message_context = AsyncMock(return_value=("父消息内容", [], []))
         message = SimpleNamespace(
             chat_id="oc_chat",
             thread_id=None,
@@ -4782,6 +4787,7 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         adapter._bot_user_id = ""
         adapter._bot_name = "Hermes"
         adapter._message_text_cache = OrderedDict()
+        adapter._parent_context_cache = OrderedDict()
         adapter._client = Mock()
         adapter._build_get_message_request = Mock(return_value=object())
         return adapter
@@ -4810,8 +4816,8 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         # No [Mentioned:] wrapper — reply-context path intentionally skips the hint.
         self.assertNotIn("[Mentioned:", result)
 
-    def test_extract_text_from_raw_content_accepts_mentions_kwarg(self):
-        from plugins.platforms.feishu.adapter import FeishuAdapter
+    def test_extract_text_from_normalized_accepts_mentions(self):
+        from plugins.platforms.feishu.adapter import FeishuAdapter, normalize_feishu_message
 
         adapter = FeishuAdapter.__new__(FeishuAdapter)
         adapter._bot_open_id = ""
@@ -4823,12 +4829,14 @@ class TestFeishuFetchMessageText(unittest.TestCase):
             id=SimpleNamespace(open_id="ou_alice", user_id=""),
             name="Alice",
         )
+        normalized = normalize_feishu_message(
+            message_type="text",
+            raw_content=json.dumps({"text": "@_user_1 hello"}),
+            mentions=[alice_mention],
+            bot=adapter._bot_identity(),
+        )
         self.assertEqual(
-            adapter._extract_text_from_raw_content(
-                msg_type="text",
-                raw_content=json.dumps({"text": "@_user_1 hello"}),
-                mentions=[alice_mention],
-            ),
+            FeishuAdapter._extract_text_from_normalized(normalized),
             "@Alice hello",
         )
 
@@ -5120,3 +5128,80 @@ class TestChatLockEviction(unittest.TestCase):
                 held.release()
 
         asyncio.run(_run())
+
+
+class TestFeishuReplyAttachmentRegression(unittest.TestCase):
+    """Regression tests for parent-reply attachment handling (PR #54570)."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_bare_mention_reply_with_parent_attachments_not_guarded(self):
+        """Bare @Bot reply to a message with attachments must not be dropped."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_chat", "name": "Feishu DM", "type": "dm"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
+        )
+        # Parent reply has an image attachment
+        adapter._fetch_message_context = AsyncMock(
+            return_value=("parent text", ["/tmp/parent_img.png"], ["image/png"])
+        )
+        # Bare mention, no real text content
+        message = SimpleNamespace(
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content='{"text":"@_bot_mention"}',
+            message_id="om_bare_reply",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=SimpleNamespace(event=SimpleNamespace(message=message)),
+                message=message,
+                sender_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+                is_bot=False,
+                chat_type="p2p",
+                message_id="om_bare_reply",
+            )
+        )
+
+        # Should have dispatched (NOT dropped by empty-text guard)
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        # Parent media should be merged into the inbound event
+        self.assertIn("/tmp/parent_img.png", event.media_urls)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_parent_context_cache_caches_lookups(self):
+        """Parent context lookups should be cached to avoid repeated API calls."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        call_count = [0]
+
+        # Set up client with im.v1.message.get that our _run_blocking will call
+        def _get(_req):
+            call_count[0] += 1
+            return SimpleNamespace(code=0, msg="ok", data=SimpleNamespace(items=[]))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(get=_get))))
+        adapter._run_blocking = AsyncMock(side_effect=lambda fn, req: fn(req))
+
+        # First call
+        text1, urls1, types1 = asyncio.run(adapter._fetch_message_context("m_cached"))
+        self.assertIsNone(text1)
+        self.assertEqual(call_count[0], 1)
+
+        # Second call, should hit cache
+        text2, urls2, types2 = asyncio.run(adapter._fetch_message_context("m_cached"))
+        self.assertIsNone(text2)
+        self.assertEqual(call_count[0], 1)  # Still 1
